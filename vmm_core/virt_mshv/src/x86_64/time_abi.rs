@@ -2219,6 +2219,35 @@ mod hw {
                     at_target as i64 - report.sample.monotonic_ns as i64,
                 );
             }
+            // TEMP(microsoft/nvx#1371): where inside the thaw call the TSCs
+            // run again.
+            for _ in 0..5 {
+                partition.inner.freeze_time().unwrap();
+                let frozen = get_vp_tsc(&partition.inner.vmfd, VpIndex::BSP).unwrap();
+                let before = sample_host_time().unwrap();
+                partition.inner.thaw_time().unwrap();
+                let after = sample_host_time().unwrap();
+                let mut best: Option<(u64, u64)> = None;
+                for _ in 0..8 {
+                    let b = sample_host_time().unwrap();
+                    let tsc = get_vp_tsc(&partition.inner.vmfd, VpIndex::BSP).unwrap();
+                    let a = sample_host_time().unwrap();
+                    let width = a.monotonic_ns - b.monotonic_ns;
+                    let since =
+                        (u128::from(tsc - frozen) * 1_000_000_000 / u128::from(tsc_hz)) as u64;
+                    let at_frozen = b.monotonic_ns + width / 2 - since;
+                    if best.is_none_or(|(w, _)| width < w) {
+                        best = Some((width, at_frozen));
+                    }
+                }
+                let (width, at_frozen) = best.unwrap();
+                println!(
+                    "NVX-THAW created={created} call={} ns resumed-before={} ns after-resumed={} ns bracket={width} ns",
+                    after.monotonic_ns - before.monotonic_ns,
+                    at_frozen as i64 - before.monotonic_ns as i64,
+                    after.monotonic_ns as i64 - at_frozen as i64,
+                );
+            }
 
             // Time resumes right after the read-back, and every VP advances
             // from the target together.
