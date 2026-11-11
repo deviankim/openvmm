@@ -1296,6 +1296,8 @@ impl TimeAbiBackend for MshvPartition {
                 )
             })?;
         }
+        // Every VP's TSC runs from the target once partition time resumes.
+        let resumed = sample_host_time();
         tracing::info!(
             created_vps = created.len(),
             vp_capacity = self.inner.vps.len(),
@@ -1311,6 +1313,7 @@ impl TimeAbiBackend for MshvPartition {
         Ok(TscSetReport {
             target,
             sample,
+            resumed: resumed?,
             readback,
             method: TscSyncMethod::FrozenWrite,
         })
@@ -2192,6 +2195,13 @@ mod hw {
             assert_eq!(report.target, target);
             assert_eq!(Some(report.sample), anchor);
             assert_eq!(report.method, TscSyncMethod::FrozenWrite);
+            // The TSCs run from the target only once partition time resumes,
+            // after the read-back.
+            let resumed_ns = report
+                .resumed
+                .monotonic_ns
+                .checked_sub(report.sample.monotonic_ns)
+                .expect("time resumes after the anchor");
             let expected: Vec<_> = (0..created).map(|vp| (VpIndex::new(vp), target)).collect();
             assert_eq!(report.readback, expected);
 
@@ -2247,6 +2257,7 @@ mod hw {
                 "time ABI backend: created {created}/{VP_CAPACITY} tsc_hz={tsc_hz} \
                  build_us={build_us} preflight_us={preflight_us} effective_cpuid_us={effective_us} \
                  ({} leaves) surface_us={surface_us} ({} leaves, {}-bit) set_us={set_us} \
+                 resumed_after_anchor_ns={resumed_ns} \
                  anchor_pairing_ns min={} p50={} p99={} max={} \
                  anchor_rate_deviation_ppm={deviation_ppm:.3} {osxsave} thawed={after:?}",
                 effective.leaves().len(),

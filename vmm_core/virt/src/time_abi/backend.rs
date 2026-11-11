@@ -87,8 +87,9 @@ pub trait TimeAbiBackend: Send + Sync {
     ///
     /// Guest time runs from the anchor: a backend that stops partition time
     /// for the set resumes it right after a successful read-back, before
-    /// returning, never at the first VP run. A failed set may leave it
-    /// stopped; the restore then fails.
+    /// returning, never at the first VP run, and reports a host sample of
+    /// the instant from which the TSCs run ([`TscSetReport::resumed`]). A
+    /// failed set may leave it stopped; the restore then fails.
     ///
     /// Core calls it once per restore, after every instantiated VP is bound
     /// (which creates it on MSHV) and its saved state is restored, and before
@@ -169,6 +170,12 @@ pub struct TscSetReport {
     pub target: u64,
     /// The host sample of the restore anchor.
     pub sample: HostTimeSample,
+    /// A host sample of the instant from which every VP's TSC runs from the
+    /// target: the anchor itself for [`TscSyncMethod::CommonOffset`], and
+    /// right after partition time resumes for [`TscSyncMethod::FrozenWrite`],
+    /// which holds the TSCs at the target until then, so that the clocks
+    /// that the VMM keeps itself can resume with the TSCs.
+    pub resumed: HostTimeSample,
     /// The read-back evidence, one entry per instantiated VP: the TSC value,
     /// or the offset for [`TscSyncMethod::CommonOffset`].
     pub readback: Vec<(VpIndex, u64)>,

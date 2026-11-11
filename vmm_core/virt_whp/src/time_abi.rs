@@ -1187,6 +1187,8 @@ impl TimeAbiBackend for WhpPartitionInner {
                 )
             })?;
         }
+        // Every VP's TSC runs from the target once partition time resumes.
+        let resumed = sample_host_time();
         tracing::info!(
             vps = readback.len(),
             target,
@@ -1201,6 +1203,7 @@ impl TimeAbiBackend for WhpPartitionInner {
         Ok(TscSetReport {
             target,
             sample,
+            resumed: resumed?,
             readback,
             method: TscSyncMethod::FrozenWrite,
         })
