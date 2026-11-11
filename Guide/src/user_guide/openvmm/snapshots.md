@@ -356,7 +356,10 @@ VM time and the RTC stop with the state units shortly before the public
 capture anchor. Every snapshot records that cut-to-anchor interval, measured
 on the host monotonic clock that the anchor samples, and a restore adds it to
 the VM-time and RTC advancement; a capture that cannot recover the interval
-fails.
+fails. VM time then runs from the instant at which the TSCs run again, the
+restore anchor on KVM and the end of the frozen write on MSHV and WHP, rather
+than from the later start of the VM, so that the emulated devices' timers keep
+their relation to the TSC however long the restore takes to start the VM.
 Snapshots without the explicit capture-time `maxcpus` opt-in reject a restore
 target. This is not a post-readiness hotplug API and cannot add VPs absent
 from the saved topology.

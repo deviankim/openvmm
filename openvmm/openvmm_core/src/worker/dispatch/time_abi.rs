@@ -38,6 +38,7 @@ use openvmm_defs::worker::SavedState;
 use parking_lot::Mutex;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnit;
+use state_unit::StateUnits;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,7 @@ use virt::time_abi::TimeAbiConfig;
 use virt::time_abi::TimeAbiError;
 use virt::time_abi::TimeAbiMsrs;
 use virt::time_abi::TimeAbiTestHooks;
+use virt::time_abi::TscSetReport;
 use virt::time_abi::TscSyncMethod;
 use virt::time_abi::host::HostClockStatus;
 use virt::time_abi::publish::HostClockPublisher;
@@ -1143,6 +1145,38 @@ pub(super) fn record_vm_time_cut(
     Ok(())
 }
 
+/// Advances the guest time that the state units keep, VM time and the RTC,
+/// by `downtime_ns`, from the snapshot's VM-time cut to the restore anchor.
+/// VM time then runs from the instant at which the synchronized TSC set
+/// `set` resumed the TSCs, rather than from the start of the state units,
+/// so that it keeps its relation to the TSCs.
+async fn advance_restored_time(
+    state_units: &mut StateUnits,
+    downtime_ns: u64,
+    set: &TscSetReport,
+) -> anyhow::Result<()> {
+    let resumed = host_instant(set.resumed.monotonic_ns)?;
+    state_units
+        .advance_time(Duration::from_nanos(downtime_ns), resumed)
+        .await?;
+    Ok(())
+}
+
+/// Returns the [`pal_async::timer::Instant`], which VM time runs on, at which
+/// the host monotonic clock that the time ABI samples read `monotonic_ns`,
+/// an instant that has passed. The two clocks run at one rate from different
+/// origins, which readings of both, taken back to back, relate.
+fn host_instant(monotonic_ns: u64) -> Result<pal_async::timer::Instant, TimeAbiError> {
+    let before = pal_async::timer::Instant::now().as_nanos();
+    let now = virt::time_abi::host::sample_host_time()?;
+    let after = pal_async::timer::Instant::now().as_nanos();
+    let paired = before + after.saturating_sub(before) / 2;
+    let since = now.monotonic_ns.saturating_sub(monotonic_ns);
+    Ok(pal_async::timer::Instant::from_nanos(
+        paired.saturating_sub(since),
+    ))
+}
+
 impl LoadedVm {
     /// Restores the guest clocks after the saved state is restored and before
     /// any restored VP runs.
@@ -1150,7 +1184,10 @@ impl LoadedVm {
     /// It performs the synchronized TSC set at the downtime selected at the
     /// restore anchor, then concurrently advances and sets every LAPIC and
     /// advances VM time and the RTC, and seals the time fields of the restore
-    /// packet. The LAPIC advance rejects a periodic or TSC-deadline timer, so
+    /// packet. VM time then runs from the instant at which the set resumed
+    /// the TSCs, as the TSCs do, rather than from the start of the state
+    /// units, so that the emulated devices' timers keep their relation to the
+    /// TSCs. The LAPIC advance rejects a periodic or TSC-deadline timer, so
     /// restore needs no separate timer check, and the PIT checks itself when
     /// restored.
     pub(super) async fn time_abi_restore(&mut self, input: RestoreTimeInput) -> anyhow::Result<()> {
@@ -1201,6 +1238,10 @@ impl LoadedVm {
             target = set.target,
             method = ?set.method,
             vps = set.readback.len(),
+            resumed_after_anchor_ns = set
+                .resumed
+                .monotonic_ns
+                .saturating_sub(set.sample.monotonic_ns),
             vm_time_cut_to_anchor_ns = input.contract.vm_time_cut_to_anchor_ns,
             vm_time_downtime_ns,
             "time ABI synchronized TSC set"
@@ -1218,10 +1259,9 @@ impl LoadedVm {
                 .await;
             (result, started.elapsed())
         };
+        let set = &set;
         let vm_time_advance = async move {
-            let result = state_units
-                .advance_time(Duration::from_nanos(vm_time_downtime_ns))
-                .await;
+            let result = advance_restored_time(state_units, vm_time_downtime_ns, set).await;
             (result, started.elapsed())
         };
         let ((lapic_result, lapic_advanced), (vm_time_result, vm_time_advanced)) =
@@ -1425,7 +1465,6 @@ mod tests {
     use virt::time_abi::BackendPreflight;
     use virt::time_abi::HostTimeSample;
     use virt::time_abi::TscAnchor;
-    use virt::time_abi::TscSetReport;
     use virt::time_abi::cpuid::effective_cpuid;
     use virt::time_abi::msr::MSR_TSC_INVARIANT_CONTROL;
     use virt::time_abi::surface::SupportedMsrValue;
@@ -3089,5 +3128,211 @@ mod tests {
         contract.capture_utc_ns += 3_600_000_000_000;
         record_vm_time_cut(&mut contract, &saved_state).unwrap();
         assert_eq!(contract.vm_time_cut_to_anchor_ns, 500_000_000);
+    }
+
+    /// A backend whose guest TSC counts host monotonic nanoseconds, at 1 GHz,
+    /// from an offset that the synchronized TSC set chooses, so that it runs
+    /// through a capture, as KVM's does. Its set holds the TSCs at the target
+    /// for `hold` after the anchor before they run, as MSHV's and WHP's
+    /// frozen writes do until partition time resumes.
+    struct MonotonicTsc {
+        offset: AtomicU64,
+        hold: Duration,
+    }
+
+    impl MonotonicTsc {
+        const HZ: u64 = 1_000_000_000;
+
+        fn tsc_at(&self, monotonic_ns: u64) -> u64 {
+            monotonic_ns.wrapping_add(self.offset.load(Ordering::SeqCst))
+        }
+    }
+
+    impl TimeAbiBackend for MonotonicTsc {
+        fn native_tsc_hz(&self) -> Result<u64, TimeAbiError> {
+            unreachable!()
+        }
+
+        fn lapic_hz(&self) -> Result<u64, TimeAbiError> {
+            unreachable!()
+        }
+
+        fn preflight(&self) -> Result<BackendPreflight, TimeAbiError> {
+            unreachable!()
+        }
+
+        fn effective_cpuid(&self) -> Result<Vec<CpuidLeaf>, TimeAbiError> {
+            unreachable!()
+        }
+
+        fn supported_cpu_surface(&self) -> Result<Option<SupportedCpuSurface>, TimeAbiError> {
+            unreachable!()
+        }
+
+        fn capture_anchor(&self) -> Result<TscAnchor, TimeAbiError> {
+            let sample = virt::time_abi::host::sample_host_time()?;
+            Ok(TscAnchor {
+                tsc: self.tsc_at(sample.monotonic_ns),
+                sample,
+                pairing_ns: 0,
+            })
+        }
+
+        fn set_synchronized_tsc(
+            &self,
+            target: &mut dyn FnMut(&HostTimeSample) -> Result<u64, TimeAbiError>,
+        ) -> Result<TscSetReport, TimeAbiError> {
+            let sample = virt::time_abi::host::sample_host_time()?;
+            let target = target(&sample)?;
+            let (resumed, method) = if self.hold.is_zero() {
+                (sample, TscSyncMethod::CommonOffset)
+            } else {
+                std::thread::sleep(self.hold);
+                (
+                    virt::time_abi::host::sample_host_time()?,
+                    TscSyncMethod::FrozenWrite,
+                )
+            };
+            self.offset
+                .store(target.wrapping_sub(resumed.monotonic_ns), Ordering::SeqCst);
+            Ok(TscSetReport {
+                target,
+                sample,
+                resumed,
+                readback: vec![(VpIndex::BSP, target)],
+                method,
+            })
+        }
+
+        fn guest_tsc_offset(&self) -> Result<GuestTscOffset, TimeAbiError> {
+            unreachable!()
+        }
+    }
+
+    /// Returns state units that hold only VM time, whose keeper reads the
+    /// time ABI's host monotonic clock when it stops, as a time ABI VM's
+    /// does, the unit, and an accessor of that VM time.
+    async fn vm_time_units(
+        driver: &pal_async::DefaultDriver,
+    ) -> (
+        StateUnits,
+        SpawnedUnit<vmcore::vmtime::VmTimeKeeper>,
+        vmcore::vmtime::VmTimeAccess,
+    ) {
+        let keeper = vmcore::vmtime::VmTimeKeeper::with_stop_clock(
+            driver,
+            vmcore::vmtime::VmTime::from_100ns(0),
+            host_monotonic_ns,
+        );
+        let access = keeper.builder().build(driver).await.unwrap().access("test");
+        let units = StateUnits::new();
+        let unit = units
+            .add(crate::worker::dispatch::VMTIME_UNIT_NAME)
+            .advances_time()
+            .spawn(driver, |recv| async move {
+                let mut keeper = keeper;
+                vmm_core::vmtime_unit::run_vmtime(&mut keeper, recv).await;
+                keeper
+            })
+            .unwrap();
+        (units, unit, access)
+    }
+
+    /// Returns TSC/F minus VM time, in nanoseconds, at one host instant: VM
+    /// time read between two host clock readings at most 100 µs apart, and
+    /// the TSC at their midpoint.
+    fn tsc_minus_vm_time(backend: &MonotonicTsc, vmtime: &vmcore::vmtime::VmTimeAccess) -> i128 {
+        for _ in 0..1000 {
+            let before = host_monotonic_ns().unwrap();
+            let now = vmtime.now();
+            let after = host_monotonic_ns().unwrap();
+            if after - before <= 100_000 {
+                let tsc = backend.tsc_at(before + (after - before) / 2);
+                return i128::from(tsc) - i128::from(now.as_100ns()) * 100;
+            }
+        }
+        panic!("no two host clock readings within 100 µs");
+    }
+
+    /// A restore keeps the relation of a VM's TSC to its VM time, the clock
+    /// of the emulated devices' timers, that the capture recorded: VM time
+    /// resumes when the synchronized TSC set resumes the TSCs, at the restore
+    /// anchor or, after a frozen write, when partition time resumes, and not
+    /// when the state units start, however much later that is.
+    #[pal_async::async_test]
+    async fn restore_keeps_the_relation_of_vm_time_to_the_tsc(driver: pal_async::DefaultDriver) {
+        let mut timer = pal_async::timer::PolledTimer::new(&driver);
+        let identity = virt::time_abi::HostIdentity {
+            host_id: [1; 16],
+            boot_id: [2; 16],
+            clock: virt::time_abi::host::host_clock_kind(),
+        };
+        for hold in [Duration::ZERO, Duration::from_millis(10)] {
+            let backend = MonotonicTsc {
+                offset: AtomicU64::new(1 << 50),
+                hold,
+            };
+
+            // The captured VM runs, then stops, and the capture anchor follows
+            // its VM-time cut.
+            let (mut units, _unit, vmtime) = vm_time_units(&driver).await;
+            units.start().await.unwrap();
+            timer.sleep(Duration::from_millis(5)).await;
+            let captured = tsc_minus_vm_time(&backend, &vmtime);
+            units.stop().await.unwrap();
+            timer.sleep(Duration::from_millis(5)).await;
+            let anchor = backend.capture_anchor().unwrap();
+            let mut contract = SnapshotTimeContract {
+                tsc_frequency_hz: MonotonicTsc::HZ,
+                capture_tsc: anchor.tsc,
+                capture_utc_ns: anchor.sample.utc_ns,
+                capture_monotonic_ns: anchor.sample.monotonic_ns,
+                host_clock: identity.clock.as_str().to_owned(),
+                host_id: identity.host_id.to_vec(),
+                host_boot_id: identity.boot_id.to_vec(),
+                ..test_time_contract()
+            };
+            let saved_state = SavedState {
+                units: units.save().await.unwrap(),
+                inventory: Vec::new(),
+            };
+            record_vm_time_cut(&mut contract, &saved_state).unwrap();
+
+            // After a downtime, a new VM restores the snapshot, sets the TSCs
+            // at the restore anchor, and advances VM time, as
+            // `time_abi_restore` does.
+            timer.sleep(Duration::from_millis(10)).await;
+            let (mut units, _unit, vmtime) = vm_time_units(&driver).await;
+            units.restore(saved_state.units).await.unwrap();
+            let capture = contract.capture_record().unwrap();
+            let mut downtime_ns = None;
+            let set = backend
+                .set_synchronized_tsc(&mut |sample| {
+                    let selected = virt::time_abi::downtime::select_downtime(
+                        &capture, &identity, sample, &NO_HOOKS,
+                    )?;
+                    downtime_ns = Some(selected.nanos);
+                    virt::time_abi::downtime::tsc_target(
+                        capture.tsc,
+                        selected.nanos,
+                        MonotonicTsc::HZ,
+                    )
+                })
+                .unwrap();
+            let vm_time_downtime_ns = contract.vm_time_downtime_ns(downtime_ns.unwrap()).unwrap();
+            advance_restored_time(&mut units, vm_time_downtime_ns, &set)
+                .await
+                .unwrap();
+
+            // The state units start well after the TSCs resume.
+            timer.sleep(Duration::from_millis(30)).await;
+            units.start().await.unwrap();
+            let skew = tsc_minus_vm_time(&backend, &vmtime) - captured;
+            assert!(
+                skew.abs() < 2_000_000,
+                "with the TSCs held for {hold:?}, TSC/F - VM time moved by {skew} ns"
+            );
+            units.stop().await.unwrap();
+        }
     }
 }
