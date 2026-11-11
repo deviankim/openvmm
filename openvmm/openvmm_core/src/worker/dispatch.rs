@@ -2070,6 +2070,7 @@ impl InitializedVm {
                     guest_tsc_offset,
                     generation: parameters.generation,
                     hooks: parameters.hooks.clone(),
+                    probe: vmtime_source.access("nvx-probe"),
                 })
             }
             None => {
@@ -4015,7 +4016,13 @@ impl LoadedVm {
                 .measure_offset()
                 .context("failed to measure the guest TSC offset")?;
         }
-        self.state_units.start().await
+        self.state_units.start().await?;
+        // TEMP(microsoft/nvx#1371): the relation once VM time starts.
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(time_abi) = &self.inner.time_abi {
+            time_abi.probe("start");
+        }
+        Ok(())
     }
 
     /// Pauses the VM, returning true if it was running.

@@ -94,6 +94,36 @@ pub(super) struct TimeAbiState {
     pub generation: u32,
     /// The active test hooks.
     pub hooks: TimeAbiTestHooks,
+    /// TEMP(microsoft/nvx#1371): reads VM time for the relation probe.
+    pub probe: vmcore::vmtime::VmTimeAccess,
+}
+
+impl TimeAbiState {
+    /// TEMP(microsoft/nvx#1371): logs TSC/F minus VM time.
+    pub(super) fn probe(&self, phase: &str) {
+        let Some(offset) = self.clock.state.lock().offset else {
+            tracing::info!(phase, "NVX-PROBE no offset");
+            return;
+        };
+        let Some(rates) = self.msrs.declared() else {
+            tracing::info!(phase, "NVX-PROBE no rates");
+            return;
+        };
+        let (bracket, vm) = virt::time_abi::tsc::HostTscBracket::around(|| self.probe.now());
+        let Some((host_tsc, _)) = bracket.midpoint() else {
+            return;
+        };
+        let tsc = offset.guest_tsc(host_tsc);
+        let relation_ns = i128::from(tsc) * 1_000_000_000 / i128::from(rates.tsc_hz)
+            - i128::from(vm.as_100ns()) * 100;
+        tracing::info!(
+            phase,
+            relation_ns = relation_ns as i64,
+            tsc,
+            vmtime_100ns = vm.as_100ns(),
+            "NVX-PROBE relation"
+        );
+    }
 }
 
 impl TimeAbiState {
@@ -1198,6 +1228,19 @@ impl LoadedVm {
             (lapic_advance, vm_time_advance).join().await;
         lapic_result?;
         vm_time_result.context("failed to advance restored VM time")?;
+        // TEMP(microsoft/nvx#1371): the relation at the restore anchor.
+        if let Some(state) = self.inner.time_abi.as_ref() {
+            let vm = state.probe.now();
+            let relation_ns = i128::from(set.target) * 1_000_000_000 / i128::from(tsc_hz)
+                - i128::from(vm.as_100ns()) * 100;
+            tracing::info!(
+                phase = "anchor",
+                relation_ns = relation_ns as i64,
+                tsc = set.target,
+                vmtime_100ns = vm.as_100ns(),
+                "NVX-PROBE relation"
+            );
+        }
         let finished = started.elapsed();
         // Per-phase durations attribute the restore.time_abi_clock profile
         // phase. The LAPIC and VM time phases overlap; each is measured from
