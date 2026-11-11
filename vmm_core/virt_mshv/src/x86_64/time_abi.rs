@@ -2204,6 +2204,21 @@ mod hw {
                 .expect("time resumes after the anchor");
             let expected: Vec<_> = (0..created).map(|vp| (VpIndex::new(vp), target)).collect();
             assert_eq!(report.readback, expected);
+            // TEMP(microsoft/nvx#1371): where VP 0's TSC was the target.
+            for _ in 0..5 {
+                let before = sample_host_time().unwrap();
+                let tsc = get_vp_tsc(&partition.inner.vmfd, VpIndex::BSP).unwrap();
+                let after = sample_host_time().unwrap();
+                let width = after.monotonic_ns - before.monotonic_ns;
+                let middle = before.monotonic_ns + width / 2;
+                let since = (u128::from(tsc - target) * 1_000_000_000 / u128::from(tsc_hz)) as u64;
+                let at_target = middle - since;
+                println!(
+                    "NVX-RESUME created={created} at_target-resumed={} ns at_target-anchor={} ns bracket={width} ns",
+                    at_target as i64 - report.resumed.monotonic_ns as i64,
+                    at_target as i64 - report.sample.monotonic_ns as i64,
+                );
+            }
 
             // Time resumes right after the read-back, and every VP advances
             // from the target together.
