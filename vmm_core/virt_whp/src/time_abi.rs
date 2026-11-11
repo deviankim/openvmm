@@ -1179,6 +1179,8 @@ impl TimeAbiBackend for WhpPartitionInner {
         // Resume before any VP runs, so the guest TSC runs from the restore
         // anchor rather than from the first VP run. A failed set leaves time
         // suspended: the restore is rejected and no VP runs.
+        // TEMP stack: as the fix, sample before the call that resumes time.
+        let resumed = sample_host_time();
         if result.is_ok() {
             partition.resume_time().map_err(|err| {
                 TimeAbiError::new(
@@ -1187,8 +1189,6 @@ impl TimeAbiBackend for WhpPartitionInner {
                 )
             })?;
         }
-        // Every VP's TSC runs from the target once partition time resumes.
-        let resumed = sample_host_time();
         tracing::info!(
             vps = readback.len(),
             target,

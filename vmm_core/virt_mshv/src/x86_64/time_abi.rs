@@ -1288,6 +1288,8 @@ impl TimeAbiBackend for MshvPartition {
         // A failed set leaves time frozen; the restore fails and tears the
         // partition down.
         let thawed = result.is_ok();
+        // TEMP stack: as the fix, sample before the call that resumes time.
+        let resumed = sample_host_time();
         if thawed {
             self.inner.thaw_time().map_err(|error| {
                 TimeAbiError::new(
@@ -1296,8 +1298,6 @@ impl TimeAbiBackend for MshvPartition {
                 )
             })?;
         }
-        // Every VP's TSC runs from the target once partition time resumes.
-        let resumed = sample_host_time();
         tracing::info!(
             created_vps = created.len(),
             vp_capacity = self.inner.vps.len(),
