@@ -1132,19 +1132,69 @@ async fn advance_restored_time(
     Ok(())
 }
 
+/// Pairings of the two host clocks that [`host_instant`] tries.
+const INSTANT_PAIRING_ATTEMPTS: usize = 16;
+
+/// A pairing this tight, in nanoseconds, ends [`host_instant`]'s attempts
+/// early.
+const INSTANT_PAIRING_TARGET_NS: u64 = 1_000;
+
 /// Returns the [`pal_async::timer::Instant`], which VM time runs on, at which
 /// the host monotonic clock that the time ABI samples read `monotonic_ns`,
 /// an instant that has passed. The two clocks run at one rate from different
-/// origins, which readings of both, taken back to back, relate.
+/// origins, which readings of both, taken back to back, relate
+/// ([`ClockPairing::tightest`]).
 fn host_instant(monotonic_ns: u64) -> Result<pal_async::timer::Instant, TimeAbiError> {
-    let before = pal_async::timer::Instant::now().as_nanos();
-    let now = virt::time_abi::host::sample_host_time()?;
-    let after = pal_async::timer::Instant::now().as_nanos();
-    let paired = before + after.saturating_sub(before) / 2;
-    let since = now.monotonic_ns.saturating_sub(monotonic_ns);
+    let pairing = ClockPairing::tightest(|| {
+        let before = pal_async::timer::Instant::now().as_nanos();
+        let host = virt::time_abi::host::sample_host_time()?;
+        let after = pal_async::timer::Instant::now().as_nanos();
+        Ok(ClockPairing::new(before, host.monotonic_ns, after))
+    })?;
+    let since = pairing.host_ns.saturating_sub(monotonic_ns);
     Ok(pal_async::timer::Instant::from_nanos(
-        paired.saturating_sub(since),
+        pairing.instant_ns.saturating_sub(since),
     ))
+}
+
+/// A reading of the time ABI's host monotonic clock, `host_ns`, paired with
+/// the midpoint, `instant_ns`, of two readings of VM time's clock around it,
+/// `width_ns` apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClockPairing {
+    instant_ns: u64,
+    host_ns: u64,
+    width_ns: u64,
+}
+
+impl ClockPairing {
+    fn new(before_ns: u64, host_ns: u64, after_ns: u64) -> Self {
+        let width_ns = after_ns.saturating_sub(before_ns);
+        Self {
+            instant_ns: before_ns + width_ns / 2,
+            host_ns,
+            width_ns,
+        }
+    }
+
+    /// Returns the tightest of up to [`INSTANT_PAIRING_ATTEMPTS`] pairings
+    /// that `pair` takes, so that a pairing that the host preempts cannot
+    /// misplace the instant by half the preemption.
+    fn tightest(
+        mut pair: impl FnMut() -> Result<Self, TimeAbiError>,
+    ) -> Result<Self, TimeAbiError> {
+        let mut tightest = pair()?;
+        for _ in 1..INSTANT_PAIRING_ATTEMPTS {
+            if tightest.width_ns <= INSTANT_PAIRING_TARGET_NS {
+                break;
+            }
+            let pairing = pair()?;
+            if pairing.width_ns < tightest.width_ns {
+                tightest = pairing;
+            }
+        }
+        Ok(tightest)
+    }
 }
 
 impl LoadedVm {
@@ -3291,5 +3341,40 @@ mod tests {
             );
             units.stop().await.unwrap();
         }
+    }
+
+    #[test]
+    fn host_instant_keeps_the_tightest_clock_pairing() {
+        // A pairing that the host preempted gives way to a tight one, which
+        // ends the attempts.
+        let mut pairings = [
+            ClockPairing::new(1_000, 50_000, 9_000),
+            ClockPairing::new(20_000, 60_000, 20_400),
+            ClockPairing::new(30_000, 70_000, 30_100),
+        ]
+        .into_iter();
+        assert_eq!(
+            ClockPairing::tightest(|| Ok(pairings.next().unwrap())).unwrap(),
+            ClockPairing {
+                instant_ns: 20_200,
+                host_ns: 60_000,
+                width_ns: 400,
+            }
+        );
+        assert_eq!(pairings.len(), 1);
+
+        // Without one that tight, every attempt runs and the tightest wins.
+        let mut attempts = 0;
+        let tightest = ClockPairing::tightest(|| {
+            attempts += 1;
+            Ok(ClockPairing::new(
+                attempts * 100_000,
+                attempts,
+                attempts * 100_000 + 5_000 + attempts.abs_diff(7) * 100,
+            ))
+        })
+        .unwrap();
+        assert_eq!(attempts, INSTANT_PAIRING_ATTEMPTS as u64);
+        assert_eq!((tightest.host_ns, tightest.width_ns), (7, 5_000));
     }
 }
