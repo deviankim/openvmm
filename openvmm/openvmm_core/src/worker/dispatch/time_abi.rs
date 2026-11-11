@@ -1118,7 +1118,8 @@ impl LoadedVm {
     /// any restored VP runs.
     ///
     /// It performs the synchronized TSC set at the downtime selected at the
-    /// restore anchor, then concurrently advances and sets every LAPIC and
+    /// restore anchor, then concurrently sets every LAPIC timer, which the
+    /// restore held, to run from the restore anchor as the TSC does, and
     /// advances VM time and the RTC, and seals the time fields of the restore
     /// packet. The LAPIC advance rejects a periodic or TSC-deadline timer, so
     /// restore needs no separate timer check, and the PIT checks itself when
@@ -1135,6 +1136,7 @@ impl LoadedVm {
             .report
             .rate_check
             .map_or(0, |check| check.rate_deviation);
+        let native_tsc_hz = state.report.native_tsc_hz;
         let capture = input.contract.capture_record()?;
         let tsc_hz = input.contract.tsc_frequency_hz;
         let apic_hz = input.contract.apic_frequency_hz;
@@ -1179,13 +1181,18 @@ impl LoadedVm {
         // state, since no backend's LAPIC reads VM time under the time ABI, so
         // they run concurrently. Both run to completion, so a failure never
         // cancels a state unit operation midway.
-        let downtime_ns = downtime.nanos;
+        let lapic_clock = virt::x86::vp::LapicRestoreClock {
+            capture_tsc: capture.tsc,
+            declared_tsc_hz: tsc_hz,
+            restore_tsc: set.target,
+            native_tsc_hz,
+            downtime_ns: downtime.nanos,
+            apic_hz,
+        };
         let partition_unit = &mut self.inner.partition_unit;
         let state_units = &mut self.state_units;
         let lapic_advance = async move {
-            let result = partition_unit
-                .advance_lapic_timers(downtime_ns, apic_hz)
-                .await;
+            let result = partition_unit.advance_lapic_timers(lapic_clock).await;
             (result, started.elapsed())
         };
         let vm_time_advance = async move {
