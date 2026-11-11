@@ -1288,7 +1288,9 @@ impl TimeAbiBackend for MshvPartition {
         // A failed set leaves time frozen; the restore fails and tears the
         // partition down.
         let thawed = result.is_ok();
-        // TEMP stack: as the fix, sample before the call that resumes time.
+        // The hypervisor restarts every VP's TSC from the target within
+        // microseconds of the start of the call that resumes partition time,
+        // which can take tens more to return.
         let resumed = sample_host_time();
         if thawed {
             self.inner.thaw_time().map_err(|error| {
@@ -2195,8 +2197,6 @@ mod hw {
             assert_eq!(report.target, target);
             assert_eq!(Some(report.sample), anchor);
             assert_eq!(report.method, TscSyncMethod::FrozenWrite);
-            // The TSCs run from the target only once partition time resumes,
-            // after the read-back.
             let resumed_ns = report
                 .resumed
                 .monotonic_ns
@@ -2204,50 +2204,29 @@ mod hw {
                 .expect("time resumes after the anchor");
             let expected: Vec<_> = (0..created).map(|vp| (VpIndex::new(vp), target)).collect();
             assert_eq!(report.readback, expected);
-            // TEMP(microsoft/nvx#1371): where VP 0's TSC was the target.
-            for _ in 0..5 {
-                let before = sample_host_time().unwrap();
-                let tsc = get_vp_tsc(&partition.inner.vmfd, VpIndex::BSP).unwrap();
-                let after = sample_host_time().unwrap();
-                let width = after.monotonic_ns - before.monotonic_ns;
-                let middle = before.monotonic_ns + width / 2;
-                let since = (u128::from(tsc - target) * 1_000_000_000 / u128::from(tsc_hz)) as u64;
-                let at_target = middle - since;
-                println!(
-                    "NVX-RESUME created={created} at_target-resumed={} ns at_target-anchor={} ns bracket={width} ns",
-                    at_target as i64 - report.resumed.monotonic_ns as i64,
-                    at_target as i64 - report.sample.monotonic_ns as i64,
-                );
-            }
-            // TEMP(microsoft/nvx#1371): where inside the thaw call the TSCs
-            // run again.
-            for _ in 0..5 {
-                partition.inner.freeze_time().unwrap();
-                let frozen = get_vp_tsc(&partition.inner.vmfd, VpIndex::BSP).unwrap();
-                let before = sample_host_time().unwrap();
-                partition.inner.thaw_time().unwrap();
-                let after = sample_host_time().unwrap();
-                let mut best: Option<(u64, u64)> = None;
-                for _ in 0..8 {
-                    let b = sample_host_time().unwrap();
+
+            // The TSCs run from the target from within microseconds after the
+            // reported resume, which precedes the call that resumes partition
+            // time: VP 0's TSC, read between two host samples, places the
+            // instant at which it was the target within half the read.
+            let (width, at_target) = (0..5)
+                .map(|_| {
+                    let before = sample_host_time().unwrap();
                     let tsc = get_vp_tsc(&partition.inner.vmfd, VpIndex::BSP).unwrap();
-                    let a = sample_host_time().unwrap();
-                    let width = a.monotonic_ns - b.monotonic_ns;
-                    let since =
-                        (u128::from(tsc - frozen) * 1_000_000_000 / u128::from(tsc_hz)) as u64;
-                    let at_frozen = b.monotonic_ns + width / 2 - since;
-                    if best.is_none_or(|(w, _)| width < w) {
-                        best = Some((width, at_frozen));
-                    }
-                }
-                let (width, at_frozen) = best.unwrap();
-                println!(
-                    "NVX-THAW created={created} call={} ns resumed-before={} ns after-resumed={} ns bracket={width} ns",
-                    after.monotonic_ns - before.monotonic_ns,
-                    at_frozen as i64 - before.monotonic_ns as i64,
-                    after.monotonic_ns as i64 - at_frozen as i64,
-                );
-            }
+                    let after = sample_host_time().unwrap();
+                    let width = after.monotonic_ns - before.monotonic_ns;
+                    let since = u128::from(tsc - target) * 1_000_000_000 / u128::from(tsc_hz);
+                    (width, before.monotonic_ns + width / 2 - since as u64)
+                })
+                .min_by_key(|&(width, _)| width)
+                .unwrap();
+            let restart_ns = at_target as i64 - report.resumed.monotonic_ns as i64;
+            let half = width.div_ceil(2) as i64;
+            assert!(
+                restart_ns + half >= 0 && restart_ns - half <= 50_000,
+                "with {created} VPs, the TSCs ran from the target {restart_ns} ns after the \
+                 reported resume, within {half} ns"
+            );
 
             // Time resumes right after the read-back, and every VP advances
             // from the target together.
@@ -2301,7 +2280,7 @@ mod hw {
                 "time ABI backend: created {created}/{VP_CAPACITY} tsc_hz={tsc_hz} \
                  build_us={build_us} preflight_us={preflight_us} effective_cpuid_us={effective_us} \
                  ({} leaves) surface_us={surface_us} ({} leaves, {}-bit) set_us={set_us} \
-                 resumed_after_anchor_ns={resumed_ns} \
+                 resumed_after_anchor_ns={resumed_ns} restarted_after_resume_ns={restart_ns} \
                  anchor_pairing_ns min={} p50={} p99={} max={} \
                  anchor_rate_deviation_ppm={deviation_ppm:.3} {osxsave} thawed={after:?}",
                 effective.leaves().len(),

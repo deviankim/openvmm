@@ -171,10 +171,12 @@ pub struct TscSetReport {
     /// The host sample of the restore anchor.
     pub sample: HostTimeSample,
     /// A host sample of the instant from which every VP's TSC runs from the
-    /// target: the anchor itself for [`TscSyncMethod::CommonOffset`], and
-    /// right after partition time resumes for [`TscSyncMethod::FrozenWrite`],
-    /// which holds the TSCs at the target until then, so that the clocks
-    /// that the VMM keeps itself can resume with the TSCs.
+    /// target: the anchor itself for [`TscSyncMethod::CommonOffset`], and,
+    /// for [`TscSyncMethod::FrozenWrite`], which holds the TSCs at the target
+    /// until partition time resumes, one taken right before the call that
+    /// resumes it, since the hypervisor restarts the TSCs within microseconds
+    /// of that call's start, however long the call takes. The clocks that the
+    /// VMM keeps itself can then resume with the TSCs.
     pub resumed: HostTimeSample,
     /// The read-back evidence, one entry per instantiated VP: the TSC value,
     /// or the offset for [`TscSyncMethod::CommonOffset`].

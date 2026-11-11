@@ -1178,8 +1178,10 @@ impl TimeAbiBackend for WhpPartitionInner {
 
         // Resume before any VP runs, so the guest TSC runs from the restore
         // anchor rather than from the first VP run. A failed set leaves time
-        // suspended: the restore is rejected and no VP runs.
-        // TEMP stack: as the fix, sample before the call that resumes time.
+        // suspended: the restore is rejected and no VP runs. The hypervisor
+        // restarts every VP's TSC from the target within microseconds of the
+        // start of the call that resumes partition time, which can take a
+        // hundred more to return.
         let resumed = sample_host_time();
         if result.is_ok() {
             partition.resume_time().map_err(|err| {
@@ -2946,46 +2948,6 @@ mod whp_tests {
         );
         assert!(differences.is_empty(), "{differences:#?}");
         assert!(populated >= test_cpuid::nonzero_entries(profile));
-    }
-
-    /// TEMP(microsoft/nvx#1371): where inside the resume call the TSCs run
-    /// again.
-    #[test]
-    #[ignore = "requires WHP"]
-    fn temp_resume_timing() {
-        for vp_count in [1, 2, 4, 8] {
-            let Some(Partition { partition, .. }) = partition(vp_count) else {
-                return;
-            };
-            let hz = partition.tsc_frequency().unwrap();
-            partition.resume_time().unwrap();
-            for _ in 0..5 {
-                partition.suspend_time().unwrap();
-                let frozen = tsc(&partition, 0);
-                let before = sample_host_time().unwrap();
-                partition.resume_time().unwrap();
-                let after = sample_host_time().unwrap();
-                let mut best: Option<(u64, u64)> = None;
-                for _ in 0..8 {
-                    let b = sample_host_time().unwrap();
-                    let t = tsc(&partition, 0);
-                    let a = sample_host_time().unwrap();
-                    let width = a.monotonic_ns - b.monotonic_ns;
-                    let since = (u128::from(t - frozen) * 1_000_000_000 / u128::from(hz)) as u64;
-                    let at_frozen = b.monotonic_ns + width / 2 - since;
-                    if best.is_none_or(|(w, _)| width < w) {
-                        best = Some((width, at_frozen));
-                    }
-                }
-                let (width, at_frozen) = best.unwrap();
-                println!(
-                    "NVX-THAW vps={vp_count} call={} ns resumed-before={} ns after-resumed={} ns bracket={width} ns",
-                    after.monotonic_ns - before.monotonic_ns,
-                    at_frozen as i64 - before.monotonic_ns as i64,
-                    after.monotonic_ns as i64 - at_frozen as i64,
-                );
-            }
-        }
     }
 
     #[test]
