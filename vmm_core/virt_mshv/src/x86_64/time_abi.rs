@@ -95,6 +95,7 @@ use virt::time_abi::publish::NativeRateBasis;
 use virt::time_abi::surface::SupportedCpuSurface;
 use virt::time_abi::tsc::GuestTscOffset;
 use virt::time_abi::tsc::OffsetSearch;
+use virt::time_abi::tsc_restart;
 
 /// The identity MSRs that OpenVMM serves. The hypervisor raises #GP for
 /// every other MSR of the identity range.
@@ -1247,6 +1248,7 @@ impl TimeAbiBackend for MshvPartition {
                 "VP 0 does not exist",
             ));
         }
+        let tsc_hz = self.native_tsc_hz()?;
 
         // Freeze partition time so that every VP holds the target from the
         // anchor until the read-back, then resume it right away.
@@ -1288,10 +1290,7 @@ impl TimeAbiBackend for MshvPartition {
         // A failed set leaves time frozen; the restore fails and tears the
         // partition down.
         let thawed = result.is_ok();
-        // The hypervisor restarts every VP's TSC from the target within
-        // microseconds of the start of the call that resumes partition time,
-        // which can take tens more to return.
-        let resumed = sample_host_time();
+        let resuming = sample_host_time();
         if thawed {
             self.inner.thaw_time().map_err(|error| {
                 TimeAbiError::new(
@@ -1300,6 +1299,7 @@ impl TimeAbiBackend for MshvPartition {
                 )
             })?;
         }
+        let resumed = sample_host_time();
         tracing::info!(
             created_vps = created.len(),
             vp_capacity = self.inner.vps.len(),
@@ -1312,10 +1312,19 @@ impl TimeAbiBackend for MshvPartition {
             "time ABI: synchronized TSC set while partition time is frozen"
         );
         result?;
+        // The hypervisor restarts every VP's TSC from the target somewhere
+        // inside the call that resumes partition time, which can take tens of
+        // microseconds to return. VP 0's TSC, read with host time after the
+        // call, places the restart.
+        let before = sample_host_time()?;
+        let tsc =
+            get_vp_tsc(vmfd, VpIndex::BSP).map_err(|error| failed(VpIndex::BSP, "read", error))?;
+        let after = sample_host_time()?;
+        let pair = AnchorCandidate { tsc, before, after }.anchor();
         Ok(TscSetReport {
             target,
             sample,
-            resumed: resumed?,
+            resumed: tsc_restart(target, tsc_hz, &resuming?, &resumed?, &pair),
             readback,
             method: TscSyncMethod::FrozenWrite,
         })
@@ -2205,10 +2214,9 @@ mod hw {
             let expected: Vec<_> = (0..created).map(|vp| (VpIndex::new(vp), target)).collect();
             assert_eq!(report.readback, expected);
 
-            // The TSCs run from the target from within microseconds after the
-            // reported resume, which precedes the call that resumes partition
-            // time: VP 0's TSC, read between two host samples, places the
-            // instant at which it was the target within half the read.
+            // The TSCs run from the target from the reported instant: VP 0's
+            // TSC, read between two host samples, places the instant at which
+            // it was the target within half the read.
             let (width, at_target) = (0..5)
                 .map(|_| {
                     let before = sample_host_time().unwrap();
@@ -2221,11 +2229,11 @@ mod hw {
                 .min_by_key(|&(width, _)| width)
                 .unwrap();
             let restart_ns = at_target as i64 - report.resumed.monotonic_ns as i64;
-            let half = width.div_ceil(2) as i64;
+            // Each read places the instant within half its bracket.
             assert!(
-                restart_ns + half >= 0 && restart_ns - half <= 50_000,
+                restart_ns.unsigned_abs() <= width + 20_000,
                 "with {created} VPs, the TSCs ran from the target {restart_ns} ns after the \
-                 reported resume, within {half} ns"
+                 reported instant, by a read within {width} ns"
             );
 
             // Time resumes right after the read-back, and every VP advances

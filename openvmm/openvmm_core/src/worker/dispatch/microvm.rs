@@ -351,6 +351,12 @@ impl LoadedVm {
         }
 
         let quiesce = openvmm_defs::profile::ProfileSpan::start();
+        // TEMP(microsoft/nvx#1371): the relation before the capture stops VM
+        // time.
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(state) = self.inner.time_abi.as_ref() {
+            state.probe("capture");
+        }
         // The VM no longer runs even if a unit does not stop, which leaves
         // the units running for the worker to tear down.
         self.running = false;
