@@ -176,8 +176,9 @@ pub fn tsc_restart(
     latest: &HostTimeSample,
     read: &TscAnchor,
 ) -> HostTimeSample {
+    // The TSC can wrap from a target near the top of its 64 bits.
     let ran_ns =
-        u128::from(read.tsc.saturating_sub(target)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
+        u128::from(read.tsc.wrapping_sub(target)) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let monotonic_ns = read
         .sample
         .monotonic_ns
@@ -491,6 +492,17 @@ mod tests {
                 &earliest,
                 &latest,
                 &read(1_120, 10_140)
+            ),
+            sample(10_080)
+        );
+        // It ran as long after wrapping from a target near the top.
+        assert_eq!(
+            tsc_restart(
+                u64::MAX - 59,
+                2_000_000_000,
+                &earliest,
+                &latest,
+                &read(60, 10_140)
             ),
             sample(10_080)
         );
